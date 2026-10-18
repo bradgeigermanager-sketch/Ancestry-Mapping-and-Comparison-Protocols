@@ -1,0 +1,324 @@
+// ============================================================================
+// MAP SPECIFICATION: PEDIGREE INFERENCE, ADMIXTURE CONFLICT DETECTION,
+//                    AND ANCESTRY GRAPH CONCORDANCE FRAMEWORK
+// Classification: Machine-Readable Functional Map / Fillable Schema
+// Target Use Cases:
+//   - Graph-based lineage resolution (Directed Acyclic Graph traversal)
+//   - Admixture decomposition and autosomal vector comparison
+//   - Detecting pedigree collapse, non-paternity events (NPE), and record conflicts
+//   - Multi-source concordance scoring between documentary records and genetic claims
+// ============================================================================
+
+// ----------------------------------------------------------------------------
+// 1. DATA SCHEMA DEFINITIONS
+// ----------------------------------------------------------------------------
+
+RECORD PopulationComponent:
+    cluster_id         : STRING   // Continental or regional label (e.g., "EUR_NW", "E_ASIA")
+    proportion         : FLOAT    // Range: [0.0, 1.0], normalized sum = 1.0
+    credible_interval  : TUPLE<FLOAT, FLOAT> // [min_ci, max_ci]
+
+RECORD AdmixtureProfile:
+    profile_id         : IDENTIFIER
+    model_version      : STRING   // Reference panel / K-cluster standard
+    components         : MAP<STRING, PopulationComponent>
+    confidence_score   : FLOAT
+
+RECORD LineageEdge:
+    parent_id          : IDENTIFIER
+    child_id           : IDENTIFIER
+    edge_type          : ENUM { BIOLOGICAL, ADOPTIVE, DOCUMENTED_LEGAL, UNVERIFIED }
+    source_attribution : STRING
+    confidence         : FLOAT    // Range: [0.0, 1.0]
+
+RECORD DocumentaryClaim:
+    claim_id           : IDENTIFIER
+    subject_id         : IDENTIFIER
+    asserted_ancestry  : MAP<STRING, FLOAT> // Asserted proportions or ethnic affiliations
+    lineage_parent_ids : LIST<IDENTIFIER>
+    evidence_class     : ENUM { VITAL_RECORD, CENSUS, SELF_REPORTED, ORAL_TRADITION }
+    source_reliability : FLOAT
+
+RECORD ConcordanceVerdict:
+    subject_id         : IDENTIFIER
+    evaluation_ts      : TIMESTAMP
+    concordance_status : ENUM { CONCORDANT, DIVERGENT_ADMIXTURE, LINEAGE_DISCONNECT, INDETERMINATE }
+    admixture_distance : FLOAT    // Cosine or Euclidean distance between profiles
+    kinship_delta      : FLOAT    // Difference between theoretical vs observed kinship coefficients
+    divergence_details : MAP<STRING, ANY>
+    remedy_instruction : ENUM { MERGE_AND_UPDATE, FLAG_DISCREPANCY, ISOLATE_CONTRADICTION }
+
+
+// ----------------------------------------------------------------------------
+// 2. MATHEMATICAL & POPULATION GENETICS UTILITIES
+// ----------------------------------------------------------------------------
+
+FUNCTION ComputeCosineDistance(prof_a: MAP<STRING, FLOAT>, prof_b: MAP<STRING, FLOAT>) -> FLOAT:
+    """
+    Computes angular divergence between two normalized ancestral admixture profiles.
+    """
+    all_keys = Union(Keys(prof_a), Keys(prof_b))
+    dot_product = 0.0
+    norm_a = 0.0
+    norm_b = 0.0
+
+    FOR EACH key IN all_keys:
+        val_a = GetDefault(prof_a, key, 0.0)
+        val_b = GetDefault(prof_b, key, 0.0)
+        dot_product = dot_product + (val_a * val_b)
+        norm_a = norm_a + (val_a ^ 2)
+        norm_b = norm_b + (val_b ^ 2)
+    ENDFOR
+
+    IF norm_a == 0.0 OR norm_b == 0.0:
+        RETURN 1.0
+
+    similarity = dot_product / (Sqrt(norm_a) * Sqrt(norm_b))
+    RETURN 1.0 - Max(0.0, Min(1.0, similarity))
+END FUNCTION
+
+
+FUNCTION CalculateTheoreticalKinship(graph_edges: LIST<LineageEdge>, id_a: IDENTIFIER, id_b: IDENTIFIER) -> FLOAT:
+    """
+    Traverses pedigree DAG to compute Wright's kinship coefficient (phi)
+    via common ancestor path-counting: sum of (1/2)^(path_length_1 + path_length_2 + 1).
+    """
+    paths_to_ancestors_a = FindAllAncestorPaths(graph_edges, id_a)
+    paths_to_ancestors_b = FindAllAncestorPaths(graph_edges, id_b)
+    common_ancestors = Intersect(Keys(paths_to_ancestors_a), Keys(paths_to_ancestors_b))
+
+    IF Length(common_ancestors) == 0:
+        RETURN 0.0
+
+    kinship_sum = 0.0
+    FOR EACH ancestor IN common_ancestors:
+        paths_a = paths_to_ancestors_a[ancestor]
+        paths_b = paths_to_ancestors_b[ancestor]
+
+        FOR EACH p_a IN paths_a:
+            FOR EACH p_b IN paths_b:
+                // Path length measures generations from individual to common ancestor
+                total_steps = Length(p_a) + Length(p_b)
+                kinship_sum = kinship_sum + ((0.5) ^ (total_steps + 1))
+            ENDFOR
+        ENDFOR
+    ENDFOR
+
+    RETURN kinship_sum
+END FUNCTION
+
+
+// ----------------------------------------------------------------------------
+// 3. ANCESTRY MAPPING & PROPAGATION PROCEDURES
+// ----------------------------------------------------------------------------
+
+PROCEDURE PropagateAdmixtureFromLineage(
+    subject_id: IDENTIFIER,
+    pedigree_graph: LIST<LineageEdge>,
+    depth_limit: INTEGER = 6
+) -> MAP<STRING, FLOAT>:
+    """
+    Synthesizes an implied ancestral admixture vector by traversing documented parental edges.
+    """
+    IF depth_limit <= 0:
+        RETURN {}
+
+    parents = GetParentsFromEdges(pedigree_graph, subject_id)
+    IF Length(parents) == 0:
+        RETURN {}
+
+    accumulated_profile = MAP<STRING, FLOAT>()
+    weight_per_parent = 1.0 / Length(parents)
+
+    FOR EACH parent_id IN parents:
+        parent_profile = FetchAdmixtureProfile(parent_id)
+        
+        // If parent has no direct empirical profile, resolve upstream recursively
+        IF parent_profile IS NULL:
+            parent_profile = PropagateAdmixtureFromLineage(parent_id, pedigree_graph, depth_limit - 1)
+        ELSE:
+            parent_profile = ExtractComponentMap(parent_profile)
+        ENDIF
+
+        FOR EACH (cluster, proportion) IN parent_profile:
+            current_val = GetDefault(accumulated_profile, cluster, 0.0)
+            accumulated_profile[cluster] = current_val + (proportion * weight_per_parent)
+        ENDFOR
+    ENDFOR
+
+    RETURN accumulated_profile
+END PROCEDURE
+
+
+PROCEDURE ConstructConsensusLineageDAG(
+    asserted_claims: LIST<DocumentaryClaim>,
+    min_confidence_floor: FLOAT = 0.4
+) -> LIST<LineageEdge>:
+    """
+    Resolves contradictory documentary lineage assertions into an acyclic consensus graph.
+    """
+    filtered_claims = Filter(asserted_claims, c -> c.source_reliability >= min_confidence_floor)
+    candidate_edges = LIST<LineageEdge>()
+
+    FOR EACH claim IN filtered_claims:
+        FOR EACH parent_id IN claim.lineage_parent_ids:
+            edge = LineageEdge(
+                parent_id = parent_id,
+                child_id = claim.subject_id,
+                edge_type = MapClaimType(claim.evidence_class),
+                source_attribution = claim.claim_id,
+                confidence = claim.source_reliability
+            )
+            candidate_edges.Append(edge)
+        ENDFOR
+    ENDFOR
+
+    // DAG integrity check: Detect and resolve cycles
+    IF DetectGraphCycles(candidate_edges):
+        candidate_edges = PruneCyclesByConfidence(candidate_edges)
+
+    RETURN candidate_edges
+END PROCEDURE
+
+
+// ----------------------------------------------------------------------------
+// 4. COMPARISON & CONCORDANCE AUDITING PROCEDURES
+// ----------------------------------------------------------------------------
+
+PROCEDURE AuditAncestryConcordance(
+    subject_id: IDENTIFIER,
+    empirical_profile: AdmixtureProfile,
+    pedigree_graph: LIST<LineageEdge>,
+    documentary_records: LIST<DocumentaryClaim>,
+    distance_threshold: FLOAT = 0.15
+) -> ConcordanceVerdict:
+    """
+    Compares observed/empirical ancestral profile against:
+      1. Implied profile propagated down the pedigree DAG.
+      2. Documentary/self-reported assertions.
+    """
+    // Step 1: Derive implied admixture from the pedigree tree
+    implied_admixture = PropagateAdmixtureFromLineage(subject_id, pedigree_graph)
+    empirical_map = ExtractComponentMap(empirical_profile)
+
+    // Fallback to documentary self-assertions if pedigree DAG is incomplete
+    IF Length(implied_admixture) == 0 AND Length(documentary_records) > 0:
+        implied_admixture = documentary_records[0].asserted_ancestry
+    ENDIF
+
+    IF Length(implied_admixture) == 0:
+        RETURN ConcordanceVerdict(
+            subject_id = subject_id,
+            evaluation_ts = CurrentTimestamp(),
+            concordance_status = INDETERMINATE,
+            admixture_distance = 0.0,
+            kinship_delta = 0.0,
+            divergence_details = {"reason": "Insufficient historical or parental data"},
+            remedy_instruction = FLAG_DISCREPANCY
+        )
+    ENDIF
+
+    // Step 2: Compute profile distance
+    divergence = ComputeCosineDistance(empirical_map, implied_admixture)
+
+    // Step 3: Kinship validation against asserted parents
+    parents = GetParentsFromEdges(pedigree_graph, subject_id)
+    max_kinship_delta = 0.0
+
+    FOR EACH parent_id IN parents:
+        empirical_kinship = QueryEmpiricalKinship(subject_id, parent_id)
+        IF empirical_kinship IS NOT NULL:
+            theoretical_kinship = CalculateTheoreticalKinship(pedigree_graph, subject_id, parent_id)
+            delta = Absolute(theoretical_kinship - empirical_kinship)
+            IF delta > max_kinship_delta:
+                max_kinship_delta = delta
+        ENDIF
+    ENDFOR
+
+    // Step 4: Evaluate thresholds and determine remediation
+    IF max_kinship_delta > 0.125: // Deviation beyond expected parent-offspring bound (0.25 nominal)
+        RETURN ConcordanceVerdict(
+            subject_id = subject_id,
+            evaluation_ts = CurrentTimestamp(),
+            concordance_status = LINEAGE_DISCONNECT,
+            admixture_distance = divergence,
+            kinship_delta = max_kinship_delta,
+            divergence_details = {
+                "violation": "Kinematic pedigree mismatch (NPE or adoption detected)",
+                "observed_parents": parents
+            },
+            remedy_instruction = ISOLATE_CONTRADICTION
+        )
+    ELSE IF divergence > distance_threshold:
+        RETURN ConcordanceVerdict(
+            subject_id = subject_id,
+            evaluation_ts = CurrentTimestamp(),
+            concordance_status = DIVERGENT_ADMIXTURE,
+            admixture_distance = divergence,
+            kinship_delta = max_kinship_delta,
+            divergence_details = {
+                "violation": "Admixture vector diverges from documented origin baseline",
+                "empirical": empirical_map,
+                "implied": implied_admixture
+            },
+            remedy_instruction = FLAG_DISCREPANCY
+        )
+    ELSE:
+        RETURN ConcordanceVerdict(
+            subject_id = subject_id,
+            evaluation_ts = CurrentTimestamp(),
+            concordance_status = CONCORDANT,
+            admixture_distance = divergence,
+            kinship_delta = max_kinship_delta,
+            divergence_details = {"status": "Empirical and recorded profiles match within tolerance"},
+            remedy_instruction = MERGE_AND_UPDATE
+        )
+    ENDIF
+END PROCEDURE
+
+
+// ----------------------------------------------------------------------------
+// 5. MASTER EXECUTION WORKFLOW
+// ----------------------------------------------------------------------------
+
+PROCEDURE RunAncestryAuditPipeline(subject_id: IDENTIFIER):
+    TRY:
+        // Ingest empirical genomics/profile data
+        empirical_data = FetchAdmixtureProfile(subject_id)
+        IF empirical_data IS NULL:
+            THROW MissingDataException("No empirical ancestry data available for: " + subject_id)
+
+        // Compile documented assertions and build consensus DAG
+        raw_claims = FetchDocumentaryClaims(subject_id)
+        pedigree_graph = ConstructConsensusLineageDAG(raw_claims)
+
+        // Execute audit
+        verdict = AuditAncestryConcordance(
+            subject_id = subject_id,
+            empirical_profile = empirical_data,
+            pedigree_graph = pedigree_graph,
+            documentary_records = raw_claims
+        )
+
+        // Apply policy
+        MATCH verdict.remedy_instruction WITH:
+            CASE MERGE_AND_UPDATE:
+                UpdateConsensusAncestryRecord(subject_id, empirical_data)
+
+            CASE FLAG_DISCREPANCY:
+                LogAncestryConflict(
+                    subject_id = subject_id,
+                    severity = "WARNING",
+                    metadata = verdict.divergence_details
+                )
+
+            CASE ISOLATE_CONTRADICTION:
+                QuarantineLineageEdge(
+                    subject_id = subject_id,
+                    reason = "Biological vs documentary pedigree contradiction",
+                    report = verdict
+                )
+
+    CATCH MissingDataException AS error:
+        LogWarning("Ancestry audit halted: " + error.message)
+END PROCEDURE
